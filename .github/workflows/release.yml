@@ -73,8 +73,9 @@ jobs:
           key: gradle-oss-${{ hashFiles('**/*.gradle.kts') }}
       - name: Generate release keystore
         run: |
-          # Generate a fresh keystore so the APK can be signed without
-          # relying on GitHub Secrets that may not be configured for forks.
+          # Remove the forked keystore (unknown password) and generate a
+          # brand-new one so the APK can be signed without GitHub Secrets.
+          rm -f release.keystore
           keytool -genkeypair -v \
             -keystore release.keystore \
             -alias nb4a \
