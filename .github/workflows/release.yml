@@ -71,15 +71,29 @@ jobs:
         with:
           path: ~/.gradle
           key: gradle-oss-${{ hashFiles('**/*.gradle.kts') }}
+      - name: Generate release keystore
+        run: |
+          # Generate a fresh keystore so the APK can be signed without
+          # relying on GitHub Secrets that may not be configured for forks.
+          keytool -genkeypair -v \
+            -keystore release.keystore \
+            -alias nb4a \
+            -keyalg RSA -keysize 2048 \
+            -validity 36500 \
+            -dname "CN=NekoBox, OU=Build, O=NekoBox, L=CI, ST=CI, C=US" \
+            -storepass nb4akey -keypass nb4akey
       - name: Gradle Build
         env:
           BUILD_PLUGIN: none
+          KEYSTORE_PASS: nb4akey
+          ALIAS_NAME: nb4a
+          ALIAS_PASS: nb4akey
         run: |
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
           echo "ndk.dir=${ANDROID_HOME}/ndk/25.0.8775105" >> local.properties
           export LOCAL_PROPERTIES="${{ secrets.LOCAL_PROPERTIES }}"
           ./run init action gradle
-          KEYSTORE_PASS="${{ secrets.KEYSTORE_PASS }}" ALIAS_NAME="${{ secrets.ALIAS_NAME }}" ALIAS_PASS="${{ secrets.ALIAS_PASS}}" ./gradlew app:assembleOssRelease
+          ./gradlew app:assembleOssRelease
           APK=$(find app/build/outputs/apk -name '*arm64-v8a*.apk')
           APK=$(dirname $APK)
           echo "APK=$APK" >> $GITHUB_ENV
