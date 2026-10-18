@@ -48,39 +48,43 @@ object XhttpExtraConverter {
             if (isSingBoxFormat(xray)) return xrayExtra
             val singBox = JSONObject()
 
-            convertFields(xray, singBox, FIELD_MAPPINGS)
-            if (xray.has("xmux")) {
-                convertXmux(xray, singBox)
+            // Xray: if "extra" is present it replaces the whole settings
+            // object (except host/path/mode), so convert from "extra" only
+            val effectiveTop = xray.optJSONObject("extra") ?: xray
+            convertFields(effectiveTop, singBox, FIELD_MAPPINGS)
+            if (effectiveTop.has("xmux")) {
+                convertXmux(effectiveTop, singBox)
             }
 
             if (xray.has("downloadSettings")) {
                 val xrayDown = xray.getJSONObject("downloadSettings")
                 val singBoxDown = JSONObject()
 
-                xrayDown.optJSONObject("xhttpSettings")?.let { xhttpSettings ->
+                // Xray also accepts the legacy key "splithttpSettings"
+                (xrayDown.optJSONObject("xhttpSettings")
+                    ?: xrayDown.optJSONObject("splithttpSettings"))?.let { xhttpSettings ->
                     convertField(xhttpSettings, singBoxDown, "mode", "mode")
                     convertField(xhttpSettings, singBoxDown, "host", "host")
                     convertField(xhttpSettings, singBoxDown, "path", "path")
-                    convertFields(xhttpSettings, singBoxDown, FIELD_MAPPINGS)
-                    if (xhttpSettings.has("xmux")) {
-                        convertXmux(xhttpSettings, singBoxDown)
-                    }
-                    // Xray: if "extra" is present it overrides the whole settings
-                    // object (except host/path/mode), so let it win on conflicts
-                    xhttpSettings.optJSONObject("extra")?.let { extra ->
-                        convertFields(extra, singBoxDown, FIELD_MAPPINGS)
-                        if (extra.has("xmux")) {
-                            convertXmux(extra, singBoxDown)
-                        }
+                    // Xray: if "extra" is present it replaces the whole settings
+                    // object (except host/path/mode), so convert from "extra"
+                    // only; otherwise fall back to the top-level fields
+                    val effective = xhttpSettings.optJSONObject("extra") ?: xhttpSettings
+                    convertFields(effective, singBoxDown, FIELD_MAPPINGS)
+                    if (effective.has("xmux")) {
+                        convertXmux(effective, singBoxDown)
                     }
                 }
                 convertField(xrayDown, singBoxDown, "address", "server")
                 convertField(xrayDown, singBoxDown, "port", "server_port")
 
-                if (xrayDown.has("security")) {
+                val securityName = xrayDown.optString("security")
+                // only tls/reality enable TLS; "none"/empty must not create a
+                // bogus tls object (previously {"enabled": true} leaked out)
+                if (securityName == "tls" || securityName == "reality") {
                     val tls = JSONObject().apply { put("enabled", true) }
 
-                    when (xrayDown.getString("security")) {
+                    when (securityName) {
                         "tls" -> {
                             xrayDown.optJSONObject("tlsSettings")?.let { tlsSettings ->
                                 convertField(tlsSettings, tls, "serverName", "server_name")
@@ -202,18 +206,48 @@ object XhttpExtraConverter {
         }
     }
 
+    // Any sing-box style (snake_case) key means the extra is already in sing-box format.
+    // Checking every mapped key (not just a handful) avoids silently wiping extras such as
+    // {"no_grpc_header": true} or {"x_padding_obfs_mode": true}, which would otherwise be
+    // mistaken for Xray format and converted into an empty object.
     private fun isSingBoxFormat(json: JSONObject): Boolean {
-        return json.has("x_padding_bytes") || json.has("sc_max_each_post_bytes") ||
-               json.has("sc_min_posts_interval_ms") || json.has("sc_stream_up_server_secs") ||
-               json.has("session_id_table") || json.has("session_id_length") ||
-               json.has("download")
+        if (json.has("download")) return true
+        if (FIELD_MAPPINGS.any { (xrayKey, singBoxKey) ->
+                singBoxKey != xrayKey && json.has(singBoxKey)
+            }) return true
+        json.optJSONObject("xmux")?.let { xmux ->
+            if (XMUX_MAPPINGS.any { (_, singBoxKey) -> xmux.has(singBoxKey) }) return true
+        }
+        return false
     }
 
     private fun isXrayFormat(json: JSONObject): Boolean {
-        return json.has("xPaddingBytes") || json.has("scMaxEachPostBytes") ||
-               json.has("scMinPostsIntervalMs") || json.has("scStreamUpServerSecs") ||
-               json.has("sessionIDTable") || json.has("sessionIDLength") ||
-               json.has("downloadSettings")
+        if (json.has("downloadSettings")) return true
+        if (FIELD_MAPPINGS.any { (xrayKey, singBoxKey) ->
+                xrayKey != singBoxKey && json.has(xrayKey)
+            }) return true
+        json.optJSONObject("xmux")?.let { xmux ->
+            if (XMUX_MAPPINGS.any { (xrayKey, _) -> xmux.has(xrayKey) }) return true
+        }
+        return false
+    }
+
+    /**
+     * Normalize a manually entered "extra" JSON to sing-box format.
+     *
+     * Users may paste Xray-style (camelCase) JSON into the xhttpExtra field;
+     * without this, the snake_case whitelist merge in
+     * buildSingBoxOutboundStreamSettings would silently drop every field.
+     */
+    fun ensureSingBoxFormat(extra: String): String {
+        if (extra.isBlank()) return extra
+        return try {
+            val json = JSONObject(extra)
+            if (isXrayFormat(json)) xrayToSingBox(extra) else extra
+        } catch (e: Exception) {
+            e.printStackTrace()
+            extra
+        }
     }
 
     private fun convertField(from: JSONObject, to: JSONObject, fromKey: String, toKey: String) {
