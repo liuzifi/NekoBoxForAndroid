@@ -565,7 +565,10 @@ fun StandardV2RayBean.toUriVMessVLESSTrojan(isTrojan: Boolean): String {
                 builder.addQueryParameter("mode", xhttpMode)
             }
             if (xhttpExtra.isNotBlank()) {
-                builder.addQueryParameter("extra", XhttpExtraConverter.singBoxToXray(xhttpExtra))
+                // normalize first: the stored value may be Xray-style if the
+                // user pasted it manually before this fix
+                val normalized = XhttpExtraConverter.ensureSingBoxFormat(xhttpExtra)
+                builder.addQueryParameter("extra", XhttpExtraConverter.singBoxToXray(normalized))
             }
         }
 
@@ -720,8 +723,11 @@ fun buildSingBoxOutboundStreamSettings(bean: StandardV2RayBean): V2RayTransportO
                     val gson = Gson()
                     // Convert base config to JSON
                     val baseJson = JSONObject(gson.toJson(baseConfig))
-                    // Parse extra config
-                    val extraJson = JSONObject(bean.xhttpExtra)
+                    // Parse extra config; normalize Xray-style (camelCase) input
+                    // so manually pasted JSON is not dropped by the whitelist
+                    val extraJson = JSONObject(
+                        XhttpExtraConverter.ensureSingBoxFormat(bean.xhttpExtra)
+                    )
                     // Merge extra fields into base config
                     val allowedKeys = arrayOf(
                         "download",
@@ -799,7 +805,13 @@ fun buildSingBoxOutboundTLS(bean: StandardV2RayBean): OutboundTLSOptions? {
             }
             if (fp.isNullOrBlank()) fp = "chrome"
         }
-        if (fp.isNotBlank()) {
+        // XHTTP over HTTP/3 (alpn starts with "h3") runs on QUIC, which needs a standard
+        // TLS config; the core's uTLS client returns "unsupported usage for uTLS" there,
+        // so a fingerprint (e.g. fp=chrome) would make every h3 connection fail.
+        // Reality is excluded because it always falls back to h2 and requires uTLS.
+        val xhttpH3 = bean.type == "xhttp" && bean.realityPubKey.isBlank() &&
+                bean.alpn.listByLineOrComma().firstOrNull() == "h3"
+        if (fp.isNotBlank() && !xhttpH3) {
             utls = OutboundUTLSOptions().apply {
                 enabled = true
                 fingerprint = fp
