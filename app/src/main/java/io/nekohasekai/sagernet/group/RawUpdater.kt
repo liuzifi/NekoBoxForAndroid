@@ -452,7 +452,7 @@ object RawUpdater : GroupUpdater() {
                                         when (opt.value) {
                                             "h2", "http" -> bean.type = "http"
                                             "ws", "grpc" -> bean.type = opt.value as String
-                                            "xhttp" -> if (bean.isVLESS) bean.type = "xhttp"
+                                            "xhttp" -> if (bean is TrojanBean || bean.isVLESS) bean.type = "xhttp"
                                         }
                                     }
 
@@ -529,7 +529,7 @@ object RawUpdater : GroupUpdater() {
                                         }
                                     }
 
-                                    "xhttp-opts" -> if (bean.isVLESS && bean.type == "xhttp") {
+                                    "xhttp-opts" -> if ((bean is TrojanBean || bean.isVLESS) && bean.type == "xhttp") {
                                         (opt.value as? Map<String, Any?>)?.also { xhttpOpts ->
                                             xhttpOpts["host"]?.toString()?.let {
                                                 bean.host = it
