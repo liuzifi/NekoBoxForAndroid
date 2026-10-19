@@ -840,8 +840,15 @@ fun buildSingBoxOutboundTLS(bean: StandardV2RayBean): OutboundTLSOptions? {
                 enabled = true
                 // "domain+https://doh" is a lookup spec, not a static config: leave config empty
                 // so the core fetches the HTTPS record (see ConfigBuilder for the DNS rule).
-                if (bean.echConfig.isNotBlank() && !isEchDnsSpec(bean.echConfig)) {
-                    config = normalizeEchConfigLines(bean.echConfig)
+                if (bean.echConfig.isNotBlank()) {
+                    if (isEchDnsSpec(bean.echConfig)) {
+                        // look up the HTTPS record of the spec's domain (e.g. cloudflare-ech.com)
+                        // instead of the SNI, like Xray / sing-box ech.query_server_name do
+                        parseEchDnsSpec(bean.echConfig)?.first?.takeIf { it.isNotBlank() }
+                            ?.let { query_server_name = it }
+                    } else {
+                        config = normalizeEchConfigLines(bean.echConfig)
+                    }
                 }
             }
         }
@@ -852,18 +859,25 @@ fun buildSingBoxOutboundTLS(bean: StandardV2RayBean): OutboundTLSOptions? {
  * The core requires a strict single PEM block ("invalid ECH configs pem" if anything
  * trails the END line), so drop blank lines / stray whitespace that pasted text often has.
  */
-/** Xray style "public.name+https://doh.example/dns-query" (or just a bare DoH URL). */
-fun isEchDnsSpec(raw: String): Boolean = raw.contains("://")
+/**
+ * A lookup spec rather than a static ECHConfigList. Accepted forms:
+ *   "public.name+https://doh.example/dns-query" (Xray), "https://doh.example/dns-query",
+ *   or a bare "public.name". Base64 never contains '.', so a dot reliably means "domain".
+ */
+fun isEchDnsSpec(raw: String): Boolean {
+    val v = raw.trim()
+    return v.contains("://") || (v.contains('.') && !v.contains("BEGIN ECH CONFIGS"))
+}
 
-/** Returns (echDomain, dohUrl) for an ECH lookup spec, or null when it is not one. */
+/** Returns (queryDomain, dohUrl); either part may be empty. Null when not a lookup spec. */
 fun parseEchDnsSpec(raw: String): Pair<String, String>? {
+    if (!isEchDnsSpec(raw)) return null
     val v = raw.trim()
     val idx = v.indexOf("://")
-    if (idx < 0) return null
+    if (idx < 0) return v to ""
     val plus = v.lastIndexOf('+', idx)
     val domain = if (plus >= 0) v.substring(0, plus).trim() else ""
     val url = (if (plus >= 0) v.substring(plus + 1) else v).trim()
-    if (url.isEmpty()) return null
     return domain to url
 }
 
