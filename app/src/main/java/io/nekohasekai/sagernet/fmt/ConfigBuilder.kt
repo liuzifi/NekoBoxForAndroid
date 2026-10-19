@@ -984,7 +984,7 @@ fun buildConfig(
         }
 
         if (forTest) {
-            dns.rules = listOf()
+            dns.rules = mutableListOf()
         } else {
             // built-in DNS rules
             route.rules.add(0, Rule_DefaultOptions().apply {
@@ -1044,21 +1044,6 @@ fun buildConfig(
                     server = "dns-direct"
                 })
             }
-            // ECH "domain+doh": ask the specified DoH server (directly) for the SNI's HTTPS record
-            echDnsLookups.entries.forEachIndexed { i, (name, doh) ->
-                val tag = "dns-ech-$i"
-                dns.servers.add(DNSServerOptions().apply {
-                    address = doh
-                    this.tag = tag
-                    detour = TAG_DIRECT
-                    address_resolver = "dns-local"
-                })
-                dns.rules.add(0, DNSRule_DefaultOptions().apply {
-                    makeSingBoxRule(listOf("full:$name"))
-                    query_type = listOf("HTTPS")
-                    server = tag
-                })
-            }
             perGroupResolver.forEach { (gid, resolver) ->
                 val hosts = perGroupServerHosts[gid]
                     ?.filter { it.isNotBlank() && isExclusiveCustomHost(it) }
@@ -1080,6 +1065,23 @@ fun buildConfig(
                     server = serverTag
                 })
             }
+        }
+
+        // ECH "domain+doh": ask the specified DoH server (directly) for the SNI's HTTPS record.
+        // Must apply to url-test configs too (they have no other DNS rules), and be the first rule.
+        echDnsLookups.entries.forEachIndexed { i, (name, doh) ->
+            val tag = "dns-ech-$i"
+            dns.servers.add(DNSServerOptions().apply {
+                address = doh
+                this.tag = tag
+                detour = TAG_DIRECT
+                address_resolver = "dns-local"
+            })
+            dns.rules.add(0, DNSRule_DefaultOptions().apply {
+                makeSingBoxRule(listOf("full:$name"))
+                query_type = listOf("HTTPS")
+                server = tag
+            })
         }
 
         if (!forTest) _hack_custom_config = DataStore.globalCustomConfig
