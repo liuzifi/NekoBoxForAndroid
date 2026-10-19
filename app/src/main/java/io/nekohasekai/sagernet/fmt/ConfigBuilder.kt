@@ -513,17 +513,21 @@ fun buildConfig(
                     } catch (_: Exception) {
                     }
 
-                    // ECH without a static config: the core looks up the HTTPS record of the SNI
-                    // through the DNS router. Without this rule that query falls to dns-remote,
-                    // which is routed through the very proxy that is waiting for the ECH config.
+                    // ECH without a static config: the core looks up an HTTPS record through its
+                    // DNS router (of the spec's domain via query_server_name, else of the SNI).
+                    // Without a rule that query falls to dns-remote, which is routed through the
+                    // very proxy that is waiting for the ECH config, so force it onto direct DNS
+                    // (or onto the DoH server given in the "domain+doh" spec).
                     if (bean is StandardV2RayBean && bean.enableECH &&
                         (bean.echConfig.isBlank() || isEchDnsSpec(bean.echConfig)) &&
                         bean.security == "tls" && bean.realityPubKey.isBlank()
                     ) {
-                        val echName = bean.sni.takeIf { it.isNotBlank() } ?: bean.serverAddress
+                        val spec = parseEchDnsSpec(bean.echConfig)
+                        val echName = spec?.first?.takeIf { it.isNotBlank() }
+                            ?: bean.sni.takeIf { it.isNotBlank() } ?: bean.serverAddress
                         if (!echName.isIpAddress()) {
                             domainListDNSDirectForce.add("full:$echName")
-                            parseEchDnsSpec(bean.echConfig)?.let { (_, doh) ->
+                            spec?.second?.takeIf { it.isNotBlank() }?.let { doh ->
                                 echDnsLookups[echName] = doh
                             }
                         }
