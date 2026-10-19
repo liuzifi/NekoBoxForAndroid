@@ -1996,6 +1996,9 @@ public class SingBoxOptions {
 
         public String config_path;
 
+        // Needs the patched core (libcore/patches/sing-box-ech-query-server-name.patch)
+        public String query_server_name;
+
     }
 
     public static class OutboundUTLSOptions extends SingBoxOption {
