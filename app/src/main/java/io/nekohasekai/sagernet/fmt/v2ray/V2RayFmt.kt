@@ -314,6 +314,16 @@ fun StandardV2RayBean.parseDuckSoft(url: HttpUrl) {
     url.queryParameter("fp")?.let {
         utlsFingerprint = it
     }
+
+    // ECH: either a base64 ECHConfigList (v2rayN style) or the Xray "domain+https://doh" form.
+    // The latter is kept verbatim in echConfig (so it survives share/backup round trips); the
+    // config builder turns it into a dedicated DNS server for the HTTPS-record lookup.
+    url.queryParameter("ech")?.takeIf { it.isNotBlank() }?.let {
+        enableECH = true
+        // '+' is decoded as a space by the query parser (it is both the base64 alphabet and the
+        // "domain+doh" separator), so restore it.
+        echConfig = it.trim().replace(' ', '+')
+    }
 }
 
 // 不确定是谁的格式
@@ -598,6 +608,14 @@ fun StandardV2RayBean.toUriVMessVLESSTrojan(isTrojan: Boolean): String {
                 if (utlsFingerprint.isNotBlank()) {
                     builder.addQueryParameter("fp", utlsFingerprint)
                 }
+                if (enableECH && echConfig.isNotBlank()) {
+                    builder.addQueryParameter(
+                        "ech",
+                        echConfig.lines().map { it.trim() }
+                            .filter { it.isNotEmpty() && !it.startsWith("-----") }
+                            .joinToString("")
+                    )
+                }
                 if (realityPubKey.isNotBlank()) {
                     builder.setQueryParameter("security", "reality")
                     builder.addQueryParameter("pbk", realityPubKey)
@@ -820,15 +838,41 @@ fun buildSingBoxOutboundTLS(bean: StandardV2RayBean): OutboundTLSOptions? {
         if (bean.enableECH) {
             ech = OutboundECHOptions().apply {
                 enabled = true
-                if (bean.echConfig.isNotBlank()) {
-                    config = if (bean.echConfig.contains("BEGIN ECH CONFIGS")) {
-                        bean.echConfig.lines()
-                    } else {
-                        listOf("-----BEGIN ECH CONFIGS-----", bean.echConfig.trim(), "-----END ECH CONFIGS-----")
-                    }
+                // "domain+https://doh" is a lookup spec, not a static config: leave config empty
+                // so the core fetches the HTTPS record (see ConfigBuilder for the DNS rule).
+                if (bean.echConfig.isNotBlank() && !isEchDnsSpec(bean.echConfig)) {
+                    config = normalizeEchConfigLines(bean.echConfig)
                 }
             }
         }
+    }
+}
+
+/**
+ * The core requires a strict single PEM block ("invalid ECH configs pem" if anything
+ * trails the END line), so drop blank lines / stray whitespace that pasted text often has.
+ */
+/** Xray style "public.name+https://doh.example/dns-query" (or just a bare DoH URL). */
+fun isEchDnsSpec(raw: String): Boolean = raw.contains("://")
+
+/** Returns (echDomain, dohUrl) for an ECH lookup spec, or null when it is not one. */
+fun parseEchDnsSpec(raw: String): Pair<String, String>? {
+    val v = raw.trim()
+    val idx = v.indexOf("://")
+    if (idx < 0) return null
+    val plus = v.lastIndexOf('+', idx)
+    val domain = if (plus >= 0) v.substring(0, plus).trim() else ""
+    val url = (if (plus >= 0) v.substring(plus + 1) else v).trim()
+    if (url.isEmpty()) return null
+    return domain to url
+}
+
+fun normalizeEchConfigLines(raw: String): List<String> {
+    val lines = raw.lines().map { it.trim() }.filter { it.isNotEmpty() }
+    return if (lines.any { it.contains("BEGIN ECH CONFIGS") }) {
+        lines
+    } else {
+        listOf("-----BEGIN ECH CONFIGS-----") + lines + listOf("-----END ECH CONFIGS-----")
     }
 }
 
