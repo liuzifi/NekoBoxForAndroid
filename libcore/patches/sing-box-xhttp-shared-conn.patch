@@ -1,0 +1,299 @@
+diff --git a/transport/v2rayxhttp/client.go b/transport/v2rayxhttp/client.go
+index 21a1319..eab288c 100644
+--- a/transport/v2rayxhttp/client.go
++++ b/transport/v2rayxhttp/client.go
+@@ -308,7 +308,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+ 				}
+ 				lastWrite = time.Now()
+ 				if dynamicXmuxClient != nil && (dynamicXmuxClient.LeftRequests.Add(-1) <= 0 ||
+-					(dynamicXmuxClient.UnreusableAt != time.Time{} && lastWrite.After(dynamicXmuxClient.UnreusableAt))) {
++					dynamicXmuxClient.IsUnreusable(lastWrite)) {
+ 					dynamicHTTPClient, dynamicXmuxClient = c.getHTTPClient()
+ 				}
+ 				go func(chunk buf.MultiBuffer, baseCtx context.Context, seqStr string, hClient DialerClient) {
+diff --git a/transport/v2rayxhttp/dialer.go b/transport/v2rayxhttp/dialer.go
+index 9a68bb2..b962342 100644
+--- a/transport/v2rayxhttp/dialer.go
++++ b/transport/v2rayxhttp/dialer.go
+@@ -42,6 +42,12 @@ type DefaultDialerClient struct {
+ 	uploadRawPool  *sync.Pool
+ 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
+ 
++	// retireFunc is bound by the owning XmuxClient. It only marks this
++	// connection as "do not reuse", so that the transport is torn down after
++	// the streams still in flight are finished instead of aborting them.
++	retireFunc func()
++	retireOnce sync.Once
++
+ 	mtx sync.RWMutex
+ }
+ 
+@@ -86,6 +92,56 @@ func (c *DefaultDialerClient) Close() {
+ 	}
+ }
+ 
++// SetRetireFunc binds the graceful retire callback supplied by the XmuxClient
++// that owns this connection.
++func (c *DefaultDialerClient) SetRetireFunc(retireFunc func()) {
++	c.mtx.Lock()
++	c.retireFunc = retireFunc
++	c.mtx.Unlock()
++}
++
++// Retire retires this connection gently: it is no longer handed out to new
++// sessions, but the streams already running on it are allowed to finish.
++// This is the correct reaction to a fatal transport error, because the whole
++// http2/http3 connection is shared by every session of the XmuxClient.
++// c.Close() must only be used when the connection has to be destroyed now.
++func (c *DefaultDialerClient) Retire() {
++	c.retireOnce.Do(func() {
++		c.mtx.RLock()
++		retireFunc := c.retireFunc
++		c.mtx.RUnlock()
++		if retireFunc != nil {
++			retireFunc()
++			return
++		}
++		c.Close()
++	})
++}
++
++// isStreamLocalError reports whether err only affected a single stream, so the
++// shared connection must be kept alive for the other sessions running on it.
++func isStreamLocalError(err error) bool {
++	if err == nil {
++		return true
++	}
++	if errors.Is(err, context.Canceled) ||
++		errors.Is(err, context.DeadlineExceeded) ||
++		errors.Is(err, net.ErrClosed) ||
++		errors.Is(err, io.EOF) ||
++		errors.Is(err, io.ErrClosedPipe) {
++		return true
++	}
++	var streamError http2.StreamError
++	if errors.As(err, &streamError) {
++		return true
++	}
++	var goAwayError http2.GoAwayError
++	if errors.As(err, &goAwayError) {
++		return true
++	}
++	return false
++}
++
+ func (c *DefaultDialerClient) IsClosed() bool {
+ 	c.mtx.RLock()
+ 	defer c.mtx.RUnlock()
+@@ -126,8 +182,11 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
+ 	go func() {
+ 		resp, errDo := c.client.Do(req)
+ 		if errDo != nil {
+-			if !uploadOnly && !errors.Is(errDo, context.Canceled) { // stream-down is enough
+-				c.Close()
++			// Only retire the connection when the transport itself is broken.
++			// A per-stream failure or a cancelled context must never reset the
++			// other sessions sharing this connection.
++			if !uploadOnly && !isStreamLocalError(errDo) {
++				c.Retire()
+ 			}
+ 			cancel()
+ 			publish(openStreamResult{err: errDo})
+@@ -136,9 +195,8 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
+ 			return
+ 		}
+ 		if resp.StatusCode != 200 || uploadOnly {
+-			if resp.StatusCode != 200 {
+-				c.Close()
+-			}
++			// A non-200 answer only invalidates this request: the connection is
++			// healthy, so it is kept for the other sessions on it.
+ 			io.Copy(io.Discard, resp.Body)
+ 			resp.Body.Close() // if it is called immediately, the upload will be interrupted also
+ 			common.Close(body)
+@@ -171,13 +229,14 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
+ 	if c.httpVersion != "1.1" {
+ 		resp, err := c.client.Do(req)
+ 		if err != nil {
+-			c.Close()
++			if !isStreamLocalError(err) {
++				c.Retire()
++			}
+ 			return err
+ 		}
+ 		_, copyErr := io.Copy(io.Discard, resp.Body)
+ 		closeErr := resp.Body.Close()
+ 		if resp.StatusCode != 200 {
+-			c.Close()
+ 			if copyErr != nil {
+ 				return copyErr
+ 			}
+@@ -196,48 +255,55 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
+ 		requestBuff := new(bytes.Buffer)
+ 		requestBuff.Grow(512 + int(req.ContentLength))
+ 		common.Must(req.Write(requestBuff))
+-		var uploadConn any
+-		var h1UploadConn *H1Conn
+ 		for {
+-			uploadConn = c.uploadRawPool.Get()
++			uploadConn := c.uploadRawPool.Get()
+ 			newConnection := uploadConn == nil
++			var h1UploadConn *H1Conn
+ 			if newConnection {
+ 				newConn, err := c.dialUploadConn(context.WithoutCancel(ctx))
+ 				if err != nil {
+ 					return err
+ 				}
+ 				h1UploadConn = NewH1Conn(newConn)
+-				uploadConn = h1UploadConn
+ 			} else {
+ 				h1UploadConn = uploadConn.(*H1Conn)
+ 				if h1UploadConn.UnreadedResponsesCount > 0 {
+ 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
+ 					if err != nil {
+-						c.Close()
+-						return fmt.Errorf("error while reading response: %s", err.Error())
++						// The pooled raw connection is broken: discard it only,
++						// then retry on a fresh one.
++						common.Close(h1UploadConn)
++						continue
+ 					}
++					h1UploadConn.UnreadedResponsesCount -= 1
+ 					_, copyErr := io.Copy(io.Discard, resp.Body)
+ 					closeErr := resp.Body.Close()
+-					if resp.StatusCode != 200 {
+-						c.Close()
+-						return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
+-					}
+ 					if copyErr != nil {
+-						return copyErr
++						common.Close(h1UploadConn)
++						continue
+ 					}
+ 					if closeErr != nil {
+-						return closeErr
++						common.Close(h1UploadConn)
++						continue
++					}
++					if resp.StatusCode != 200 {
++						common.Close(h1UploadConn)
++						return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
+ 					}
+ 				}
+ 			}
+ 			_, err := h1UploadConn.Write(requestBuff.Bytes())
+-			if err == nil {
+-				break
+-			} else if newConnection {
+-				return err
++			if err != nil {
++				common.Close(h1UploadConn)
++				if newConnection {
++					return err
++				}
++				continue
+ 			}
++			h1UploadConn.UnreadedResponsesCount += 1
++			c.uploadRawPool.Put(h1UploadConn)
++			break
+ 		}
+-		c.uploadRawPool.Put(uploadConn)
+ 	}
+ 	return nil
+ }
+diff --git a/transport/v2rayxhttp/mux.go b/transport/v2rayxhttp/mux.go
+index 8f4cf05..7a0623d 100644
+--- a/transport/v2rayxhttp/mux.go
++++ b/transport/v2rayxhttp/mux.go
+@@ -22,10 +22,10 @@ type XmuxClient struct {
+ 	openUsage    int32
+ 	leftUsage    int32
+ 	LeftRequests atomic.Int32
+-	UnreusableAt time.Time
+ 
+-	closed bool
+-	mtx    sync.Mutex
++	unreusableAt time.Time
++	closed       bool
++	mtx          sync.Mutex
+ }
+ 
+ func (c *XmuxClient) Close() {
+@@ -52,6 +52,40 @@ func (c *XmuxClient) GetOpenUsage() int32 {
+ 	return c.openUsage
+ }
+ 
++// MarkUnreusable retires this client: no new session will be handed out on it,
++// while the sessions already running on it keep working until they finish.
++// It is called by the underlying DialerClient. This must NOT close the
++// connection immediately, otherwise every session sharing it is reset.
++func (c *XmuxClient) MarkUnreusable() {
++	c.mtx.Lock()
++	defer c.mtx.Unlock()
++	if c.unreusableAt.IsZero() || c.unreusableAt.After(time.Now()) {
++		c.unreusableAt = time.Now()
++	}
++}
++
++// setUnreusableAt schedules the retirement of this client at the given moment.
++func (c *XmuxClient) setUnreusableAt(t time.Time) {
++	c.mtx.Lock()
++	defer c.mtx.Unlock()
++	c.unreusableAt = t
++}
++
++// IsUnreusable reports whether the client has been retired.
++func (c *XmuxClient) IsUnreusable(now time.Time) bool {
++	c.mtx.Lock()
++	defer c.mtx.Unlock()
++	return !c.unreusableAt.IsZero() && (now.After(c.unreusableAt) || now.Equal(c.unreusableAt))
++}
++
++// GetUnreusableAt returns the moment the client was retired, or the zero time
++// when it is still reusable.
++func (c *XmuxClient) GetUnreusableAt() time.Time {
++	c.mtx.Lock()
++	defer c.mtx.Unlock()
++	return c.unreusableAt
++}
++
+ type XmuxManager struct {
+ 	options     option.V2RayXHTTPXmuxOptions
+ 	concurrency int32
+@@ -85,6 +119,11 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
+ 		XmuxConn:  m.newConnFunc(),
+ 		leftUsage: -1,
+ 	}
++	// Let the connection retire itself gracefully instead of being closed hard
++	// by a single failed request.
++	if binder, ok := xmuxClient.XmuxConn.(interface{ SetRetireFunc(func()) }); ok {
++		binder.SetRetireFunc(xmuxClient.MarkUnreusable)
++	}
+ 	if x := m.options.GetNormalizedCMaxReuseTimes().Rand(); x > 0 {
+ 		xmuxClient.leftUsage = x - 1
+ 	}
+@@ -93,7 +132,7 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
+ 		xmuxClient.LeftRequests.Store(x)
+ 	}
+ 	if x := m.options.GetNormalizedHMaxReusableSecs().Rand(); x > 0 {
+-		xmuxClient.UnreusableAt = time.Now().Add(time.Duration(x) * time.Second)
++		xmuxClient.setUnreusableAt(time.Now().Add(time.Duration(x) * time.Second))
+ 	}
+ 	m.xmuxClients = append(m.xmuxClients, xmuxClient)
+ 	return xmuxClient
+@@ -102,13 +141,14 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
+ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient {
+ 	m.mtx.Lock()
+ 	defer m.mtx.Unlock()
++	now := time.Now()
+ 	var evicted []*XmuxClient
+ 	for i := 0; i < len(m.xmuxClients); {
+ 		xmuxClient := m.xmuxClients[i]
+ 		if xmuxClient.XmuxConn.IsClosed() ||
+ 			xmuxClient.leftUsage == 0 ||
+ 			xmuxClient.LeftRequests.Load() <= 0 ||
+-			(xmuxClient.UnreusableAt != time.Time{} && time.Now().After(xmuxClient.UnreusableAt)) {
++			xmuxClient.IsUnreusable(now) {
+ 			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
+ 			evicted = append(evicted, xmuxClient)
+ 		} else {

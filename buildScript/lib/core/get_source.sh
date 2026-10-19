@@ -18,6 +18,10 @@ git checkout --force "$COMMIT_SING_BOX"
 # Backport of ech.query_server_name (sing-box 1.13): lets ECH look up the HTTPS record of the
 # "ech=<domain>+<doh>" domain (e.g. cloudflare-ech.com) instead of the SNI.
 git apply "$PATCH_DIR/sing-box-ech-query-server-name.patch"
+# xhttp: a failed POST/GET (or a non-200 answer) must only fail that single stream, and a fatal
+# transport error must retire the shared connection gracefully instead of Close()-ing it, which
+# used to reset every VLESS/Trojan session multiplexed on the same HTTP/2 or HTTP/3 connection.
+git apply "$PATCH_DIR/sing-box-xhttp-shared-conn.patch"
 popd
 
 ####
