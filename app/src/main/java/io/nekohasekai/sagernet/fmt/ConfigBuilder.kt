@@ -24,6 +24,8 @@ import io.nekohasekai.sagernet.fmt.juicity.JuicityBean
 import io.nekohasekai.sagernet.fmt.juicity.buildSingBoxOutboundJuicityBean
 import io.nekohasekai.sagernet.fmt.v2ray.StandardV2RayBean
 import io.nekohasekai.sagernet.fmt.v2ray.buildSingBoxOutboundStandardV2RayBean
+import io.nekohasekai.sagernet.fmt.v2ray.isEchDnsSpec
+import io.nekohasekai.sagernet.fmt.v2ray.parseEchDnsSpec
 import io.nekohasekai.sagernet.fmt.shadowsocksr.ShadowsocksRBean
 import io.nekohasekai.sagernet.fmt.shadowsocksr.buildSingBoxOutboundShadowsocksRBean
 import io.nekohasekai.sagernet.fmt.snell.SnellBean
@@ -172,6 +174,8 @@ fun buildConfig(
     val buildSelector = !forTest && group?.isSelector == true && !forExport
     val userDNSRuleList = mutableListOf<DNSRule_DefaultOptions>()
     val domainListDNSDirectForce = mutableListOf<String>()
+    // ECH "domain+doh" lookups: SNI -> DoH url (HTTPS records of the SNI are asked from this server)
+    val echDnsLookups = linkedMapOf<String, String>()
     val bypassDNSBeans = hashSetOf<AbstractBean>()
     val perGroupResolver = HashMap<Long, String>()
     val perGroupServerHosts = HashMap<Long, MutableSet<String>>()
@@ -507,6 +511,22 @@ fun buildConfig(
                             _hack_config_map["udp_over_tcp"] = true
                         }
                     } catch (_: Exception) {
+                    }
+
+                    // ECH without a static config: the core looks up the HTTPS record of the SNI
+                    // through the DNS router. Without this rule that query falls to dns-remote,
+                    // which is routed through the very proxy that is waiting for the ECH config.
+                    if (bean is StandardV2RayBean && bean.enableECH &&
+                        (bean.echConfig.isBlank() || isEchDnsSpec(bean.echConfig)) &&
+                        bean.security == "tls" && bean.realityPubKey.isBlank()
+                    ) {
+                        val echName = bean.sni.takeIf { it.isNotBlank() } ?: bean.serverAddress
+                        if (!echName.isIpAddress()) {
+                            domainListDNSDirectForce.add("full:$echName")
+                            parseEchDnsSpec(bean.echConfig)?.let { (_, doh) ->
+                                echDnsLookups[echName] = doh
+                            }
+                        }
                     }
 
                     // domain_strategy
@@ -1022,6 +1042,21 @@ fun buildConfig(
                 dns.rules.add(0, DNSRule_DefaultOptions().apply {
                     makeSingBoxRule(domainListDNSDirectForce.toHashSet().toList())
                     server = "dns-direct"
+                })
+            }
+            // ECH "domain+doh": ask the specified DoH server (directly) for the SNI's HTTPS record
+            echDnsLookups.entries.forEachIndexed { i, (name, doh) ->
+                val tag = "dns-ech-$i"
+                dns.servers.add(DNSServerOptions().apply {
+                    address = doh
+                    this.tag = tag
+                    detour = TAG_DIRECT
+                    address_resolver = "dns-local"
+                })
+                dns.rules.add(0, DNSRule_DefaultOptions().apply {
+                    makeSingBoxRule(listOf("full:$name"))
+                    query_type = listOf("HTTPS")
+                    server = tag
                 })
             }
             perGroupResolver.forEach { (gid, resolver) ->
