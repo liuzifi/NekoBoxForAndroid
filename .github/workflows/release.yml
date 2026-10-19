@@ -73,18 +73,6 @@ jobs:
         with:
           path: ~/.gradle
           key: gradle-oss-${{ hashFiles('**/*.gradle.kts') }}
-      - name: Generate release keystore
-        run: |
-          # Remove the forked keystore (unknown password) and generate a
-          # brand-new one so the APK can be signed without GitHub Secrets.
-          rm -f release.keystore
-          keytool -genkeypair -v \
-            -keystore release.keystore \
-            -alias nb4a \
-            -keyalg RSA -keysize 2048 \
-            -validity 36500 \
-            -dname "CN=NekoBox, OU=Build, O=NekoBox, L=CI, ST=CI, C=US" \
-            -storepass nb4akey -keypass nb4akey
       - name: Gradle Build
         env:
           BUILD_PLUGIN: none
