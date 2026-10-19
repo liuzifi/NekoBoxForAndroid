@@ -1,0 +1,70 @@
+diff --git a/common/tls/ech.go b/common/tls/ech.go
+index 5e9fba6..b19120f 100644
+--- a/common/tls/ech.go
++++ b/common/tls/ech.go
+@@ -51,6 +51,7 @@ func parseECHClientConfig(ctx context.Context, clientConfig ECHCapableConfig, op
+ 		return &ECHClientConfig{
+ 			ECHCapableConfig: clientConfig,
+ 			dnsRouter:        service.FromContext[adapter.DNSRouter](ctx),
++			queryServerName:  options.ECH.QueryServerName,
+ 		}, nil
+ 	}
+ }
+@@ -112,6 +113,8 @@ type ECHClientConfig struct {
+ 	dnsRouter  adapter.DNSRouter
+ 	lastTTL    time.Duration
+ 	lastUpdate time.Time
++
++	queryServerName string
+ }
+ 
+ func (s *ECHClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
+@@ -130,13 +133,17 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn)
+ 	s.access.Lock()
+ 	defer s.access.Unlock()
+ 	if len(s.ECHConfigList()) == 0 || s.lastTTL == 0 || time.Since(s.lastUpdate) > s.lastTTL {
++		queryName := s.queryServerName
++		if queryName == "" {
++			queryName = s.ServerName()
++		}
+ 		message := &mDNS.Msg{
+ 			MsgHdr: mDNS.MsgHdr{
+ 				RecursionDesired: true,
+ 			},
+ 			Question: []mDNS.Question{
+ 				{
+-					Name:   mDNS.Fqdn(s.ServerName()),
++					Name:   mDNS.Fqdn(queryName),
+ 					Qtype:  mDNS.TypeHTTPS,
+ 					Qclass: mDNS.ClassINET,
+ 				},
+@@ -175,7 +182,13 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn)
+ }
+ 
+ func (s *ECHClientConfig) Clone() Config {
+-	return &ECHClientConfig{ECHCapableConfig: s.ECHCapableConfig.Clone().(ECHCapableConfig), dnsRouter: s.dnsRouter, lastUpdate: s.lastUpdate}
++	return &ECHClientConfig{
++		ECHCapableConfig: s.ECHCapableConfig.Clone().(ECHCapableConfig),
++		dnsRouter:        s.dnsRouter,
++		lastTTL:          s.lastTTL,
++		lastUpdate:       s.lastUpdate,
++		queryServerName:  s.queryServerName,
++	}
+ }
+ 
+ func UnmarshalECHKeys(raw []byte) ([]tls.EncryptedClientHelloKey, error) {
+diff --git a/option/tls.go b/option/tls.go
+index 1c09527..01458fb 100644
+--- a/option/tls.go
++++ b/option/tls.go
+@@ -101,6 +101,10 @@ type OutboundECHOptions struct {
+ 	Config     badoption.Listable[string] `json:"config,omitempty"`
+ 	ConfigPath string                     `json:"config_path,omitempty"`
+ 
++	// QueryServerName overrides the domain used for the HTTPS record query
++	// when no static config is given (backport of sing-box 1.13 ech.query_server_name).
++	QueryServerName string `json:"query_server_name,omitempty"`
++
+ 	// Deprecated: not supported by stdlib
+ 	PQSignatureSchemesEnabled bool `json:"pq_signature_schemes_enabled,omitempty"`
+ 	// Deprecated: added by fault
